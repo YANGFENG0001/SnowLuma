@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
+  applyOneBotEndpointOverrides,
   assertValidOneBotConfig,
   loadOneBotConfig,
   makeDefaultOneBotConfig,
@@ -696,5 +697,163 @@ describe('OneBot listen port environment overrides', () => {
     process.env.SNOWLUMA_ONEBOT_HTTP_PORT = 'nope';
     const loaded = loadOneBotConfig('10001', { persistDefaults: true });
     expect(loaded.networks.httpServers[0]?.port).toBe(3000);
+  });
+});
+
+describe('OneBot endpoint environment overrides', () => {
+  const ENV_NAMES = ['SNOWLUMA_ONEBOT_HOST', 'SNOWLUMA_ONEBOT_TOKEN'];
+  let tempDir = '';
+  let previous = '';
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'snowluma-onebot-endpoint-env-'));
+    previous = process.cwd();
+    process.chdir(tempDir);
+    for (const name of ENV_NAMES) {
+      saved[name] = process.env[name];
+      delete process.env[name];
+    }
+  });
+
+  afterEach(() => {
+    for (const name of ENV_NAMES) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+    process.chdir(previous);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('returns the same config instance when neither variable is set', () => {
+    const config = makeDefaultOneBotConfig();
+    expect(applyOneBotEndpointOverrides(config, {})).toBe(config);
+  });
+
+  it('treats blank values as unset', () => {
+    const config = makeDefaultOneBotConfig();
+    expect(applyOneBotEndpointOverrides(config, {
+      SNOWLUMA_ONEBOT_HOST: '   ',
+      SNOWLUMA_ONEBOT_TOKEN: '',
+    })).toBe(config);
+  });
+
+  it('binds both factory listeners to the requested host and token', () => {
+    const overridden = applyOneBotEndpointOverrides(makeDefaultOneBotConfig(), {
+      SNOWLUMA_ONEBOT_HOST: '0.0.0.0',
+      SNOWLUMA_ONEBOT_TOKEN: 'operator-token',
+    });
+
+    expect(overridden.networks.httpServers[0]?.host).toBe('0.0.0.0');
+    expect(overridden.networks.wsServers[0]?.host).toBe('0.0.0.0');
+    expect(overridden.networks.httpServers[0]?.accessToken).toBe('operator-token');
+    expect(overridden.networks.wsServers[0]?.accessToken).toBe('operator-token');
+  });
+
+  it('unifies the two factory tokens that are otherwise minted independently', () => {
+    const factory = makeDefaultOneBotConfig();
+    const before = [
+      factory.networks.httpServers[0]?.accessToken,
+      factory.networks.wsServers[0]?.accessToken,
+    ];
+
+    const overridden = applyOneBotEndpointOverrides(factory, {
+      SNOWLUMA_ONEBOT_TOKEN: 'one-token-for-both',
+    });
+    const after = [
+      overridden.networks.httpServers[0]?.accessToken,
+      overridden.networks.wsServers[0]?.accessToken,
+    ];
+
+    expect(new Set(before).size).toBe(2); // random per listener
+    expect(after).toEqual(['one-token-for-both', 'one-token-for-both']);
+    expect(factory.networks.httpServers[0]?.accessToken).toBe(before[0]); // input untouched
+  });
+
+  it('leaves operator-defined listeners on their saved host and token', () => {
+    const config = makeDefaultOneBotConfig();
+    config.networks.httpServers.push({
+      name: 'public-http',
+      host: '10.0.0.1',
+      port: 4000,
+      path: '/',
+      accessToken: 'custom-token',
+      messageFormat: 'array',
+      reportSelfMessage: false,
+    });
+    saveOneBotConfig('10001', config);
+
+    process.env.SNOWLUMA_ONEBOT_HOST = '0.0.0.0';
+    process.env.SNOWLUMA_ONEBOT_TOKEN = 'operator-token';
+    const loaded = loadOneBotConfig('10001');
+
+    const custom = loaded.networks.httpServers.find((server) => server.name === 'public-http');
+    expect(custom?.host).toBe('10.0.0.1');
+    expect(custom?.accessToken).toBe('custom-token');
+    expect(loaded.networks.httpServers[0]?.host).toBe('0.0.0.0');
+    expect(loaded.networks.httpServers[0]?.accessToken).toBe('operator-token');
+  });
+
+  it('does not write the override back to onebot_<uin>.json', () => {
+    const factory = makeDefaultOneBotConfig();
+    const factoryHost = factory.networks.httpServers[0]?.host;
+    const factoryToken = factory.networks.httpServers[0]?.accessToken;
+    saveOneBotConfig('10001', factory);
+
+    process.env.SNOWLUMA_ONEBOT_HOST = '0.0.0.0';
+    process.env.SNOWLUMA_ONEBOT_TOKEN = 'operator-token';
+    const loaded = loadOneBotConfig('10001');
+    expect(loaded.networks.httpServers[0]?.host).toBe('0.0.0.0');
+
+    const onDisk = JSON.parse(
+      fs.readFileSync(path.join(tempDir, 'config', 'onebot_10001.json'), 'utf8'),
+    ) as { networks: { httpServers: Array<{ host: string; accessToken?: string }> } };
+    expect(onDisk.networks.httpServers[0]?.host).toBe(factoryHost);
+    expect(onDisk.networks.httpServers[0]?.accessToken).toBe(factoryToken);
+  });
+
+  it('ignores a host that would create a deterministic bind conflict', () => {
+    const config = makeDefaultOneBotConfig();
+    // Legal on disk: 10.0.0.1:3000 does not clash with the factory 127.0.0.1:3000.
+    config.networks.wsServers.push({
+      name: 'shadow',
+      host: '10.0.0.1',
+      port: 3000,
+      path: '/ws',
+      messageFormat: 'array',
+      reportSelfMessage: false,
+    });
+    saveOneBotConfig('10001', config);
+
+    // Rebinding the factory listener to 10.0.0.1 collides with `shadow`.
+    process.env.SNOWLUMA_ONEBOT_HOST = '10.0.0.1';
+    const loaded = loadOneBotConfig('10001');
+    expect(loaded.networks.httpServers[0]?.host).toBe('127.0.0.1');
+    expect(loaded.networks.wsServers[0]?.host).toBe('127.0.0.1');
+  });
+
+  it('is a no-op when the named factory listener is absent', () => {
+    const config = makeDefaultOneBotConfig();
+    config.networks.httpServers = [];
+    config.networks.wsServers = [];
+
+    const overridden = applyOneBotEndpointOverrides(config, {
+      SNOWLUMA_ONEBOT_HOST: '0.0.0.0',
+      SNOWLUMA_ONEBOT_TOKEN: 'operator-token',
+    });
+    expect(overridden.networks.httpServers).toEqual([]);
+    expect(overridden.networks.wsServers).toEqual([]);
+  });
+
+  it('survives an HTTP-only or WS-only deployment', () => {
+    const config = makeDefaultOneBotConfig();
+    config.networks.wsServers = [];
+
+    const overridden = applyOneBotEndpointOverrides(config, {
+      SNOWLUMA_ONEBOT_HOST: '0.0.0.0',
+      SNOWLUMA_ONEBOT_TOKEN: 'operator-token',
+    });
+    expect(overridden.networks.httpServers[0]?.host).toBe('0.0.0.0');
+    expect(overridden.networks.httpServers[0]?.accessToken).toBe('operator-token');
   });
 });

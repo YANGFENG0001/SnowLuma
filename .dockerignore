@@ -1,0 +1,10 @@
+# 构建上下文只需要「构建产物 + Dockerfile」。
+#
+# 不这样收窄的话，`context: .` 会把 node_modules/（数万个文件、上百 MB）和整个
+# monorepo 源码都传给 docker daemon，构建会慢得离谱（CI 上尤其明显）。
+#
+# 注意：dist/ 必须在构建之前由工作流里的 `pnpm build:all` 生成好 —— 构建镜像
+# 本身不跑 Node 构建，只负责把产物塞进基础镜像（见 Dockerfile 顶部注释）。
+*
+!dist
+!Dockerfile

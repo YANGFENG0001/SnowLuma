@@ -111,9 +111,9 @@ export function loadOneBotConfig(uin: string, options: LoadOneBotConfigOptions =
     saveOneBotConfig(uin, config, { mode: globalRaw ? 'overlay' : 'snapshot' });
   }
 
-  // Listen-port overrides stay in memory. Persisting them would bake a
-  // machine-specific port into onebot_<uin>.json.
-  return applyOneBotListenPortOverrides(config);
+  // Listen-port / endpoint overrides stay in memory. Persisting them would bake
+  // a machine-specific port, bind host and secret into onebot_<uin>.json.
+  return applyOneBotEndpointOverrides(applyOneBotListenPortOverrides(config));
 }
 
 const HTTP_DEFAULT_SERVER = 'http-default';
@@ -173,6 +173,82 @@ function assignFactoryPort(
     return false;
   }
   server.port = port;
+  return true;
+}
+
+/**
+ * 用环境变量覆盖工厂监听器的**绑定地址**与**访问令牌**。
+ *
+ * 为什么需要：
+ *   · 容器化部署时 OneBot 端口要和 MaiBot 之类的兄弟容器通信，而工厂默认绑
+ *     `127.0.0.1`，容器外（含同网络的其他容器）根本连不上；
+ *   · 访问令牌默认是每次物化配置时新生成的随机串（`http-default` 与
+ *     `ws-default` 各生成一份，两者还会不一致），运营方无法预先在客户端配好，
+ *     只能事后回填，且协议端一旦重新生成就整体失联。
+ *
+ * 与监听端口覆盖同构：**只作用于工厂监听器**（`http-default` / `ws-default`），
+ * 运营方手工加的自定义适配器保留自己保存的地址与令牌。
+ *
+ * 两者都**只在内存中生效**：落盘会把「这台机器的特定端点」和「运营方的密钥」
+ * 烤进 `onebot_<uin>.json`，既不可移植也会泄漏。
+ *
+ * 变量未设置时原样返回，独立运行保持既有行为不变。
+ */
+export function applyOneBotEndpointOverrides(
+  config: OneBotConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): OneBotConfig {
+  const host = readNonEmptyEnv('SNOWLUMA_ONEBOT_HOST', env);
+  const token = readNonEmptyEnv('SNOWLUMA_ONEBOT_TOKEN', env);
+  if (host === undefined && token === undefined) return config;
+
+  const next = structuredClone(config);
+  const httpApplied = assignFactoryEndpoint(
+    next.networks.httpServers,
+    HTTP_DEFAULT_SERVER,
+    { host, token },
+  );
+  const wsApplied = assignFactoryEndpoint(
+    next.networks.wsServers,
+    WS_DEFAULT_SERVER,
+    { host, token },
+  );
+  if (!httpApplied && !wsApplied) return config;
+
+  try {
+    assertValidOneBotConfig(next);
+  } catch (error) {
+    log.warn(
+      'OneBot endpoint override ignored: %s',
+      error instanceof Error ? error.message : String(error),
+    );
+    return config;
+  }
+  log.info(
+    'OneBot endpoint override applied: host=%s token=%s listeners=%d',
+    host ?? '(unchanged)',
+    token === undefined ? '(unchanged)' : '(set)',
+    (httpApplied ? 1 : 0) + (wsApplied ? 1 : 0),
+  );
+  return next;
+}
+
+function readNonEmptyEnv(name: string, env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env[name];
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function assignFactoryEndpoint(
+  servers: Array<{ name: string; host?: string; accessToken?: string }>,
+  name: string,
+  patch: { host?: string; token?: string },
+): boolean {
+  const server = servers.find((entry) => entry.name === name);
+  if (!server) return false;
+  if (patch.host !== undefined) server.host = patch.host;
+  if (patch.token !== undefined) server.accessToken = patch.token;
   return true;
 }
 
